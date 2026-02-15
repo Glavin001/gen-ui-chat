@@ -12,6 +12,7 @@ import { openai } from "@ai-sdk/openai";
 import { pipeJsonRender } from "@json-render/core";
 import { generateSystemPrompt } from "@/lib/system-prompt";
 import { tools } from "@/lib/tools";
+import { claudeCode } from 'ai-sdk-provider-claude-code';
 
 export const maxDuration = 60;
 
@@ -90,6 +91,10 @@ function injectToolCallIdsIntoMessages(
  * Select the AI model based on available API keys.
  */
 function getModel() {
+  return claudeCode('haiku', {
+    allowedTools: ['WebSearch', 'WebFetch', 'Read', 'LS'],
+  });
+
   if (
     process.env.ANTHROPIC_API_KEY &&
     process.env.ANTHROPIC_API_KEY !== "your-api-key-here"
