@@ -2,7 +2,7 @@
 
 import { cn } from "@/lib/cn";
 
-export type ViewMode = "preview" | "raw" | "split";
+export type ViewMode = "preview" | "raw" | "split" | "state";
 
 interface ViewModeToggleProps {
   mode: ViewMode;
@@ -13,6 +13,7 @@ const modes: { value: ViewMode; label: string; title: string }[] = [
   { value: "preview", label: "Preview", title: "Rendered UI (default)" },
   { value: "raw", label: "Raw", title: "Raw AI output for debugging" },
   { value: "split", label: "Split", title: "Side-by-side comparison" },
+  { value: "state", label: "State", title: "Inspect accumulated state model for debugging $state references" },
 ];
 
 export function ViewModeToggle({ mode, onChange }: ViewModeToggleProps) {

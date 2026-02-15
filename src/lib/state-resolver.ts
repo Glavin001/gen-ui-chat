@@ -208,14 +208,17 @@ export function computeTransforms(
 /**
  * Build the combined state model from tool results, spec state, and transform outputs.
  *
+ * Aligned with json-render convention: $state paths resolve relative to the
+ * state object, so spec state is spread at the root level.
+ *
  * State model layout (JSON Pointer paths):
- *   /state/{key}        → spec state data (e.g. /state/weatherData)
+ *   /{key}              → spec state data (e.g. /weather/hourly) — json-render convention
+ *   /state/{key}        → same spec state (backward compat alias)
  *   /tools/{toolName}   → tool result data
  *   /tools/{callId}     → tool result data (by call ID)
- *   /tx/{key}           → transform output value
+ *   /tx/{key}           → transform output value (overrides raw defs from spec state)
  *
- * The spec's state tree is preserved under /state/ so that $state references
- * like "/state/weatherData" resolve correctly.
+ * Reserved keys: `state`, `tools`, `tx` — spec state keys with these names are shadowed.
  */
 export function buildStateModel(
   toolResults: Record<string, unknown>,
@@ -223,11 +226,13 @@ export function buildStateModel(
   txOutputs: Record<string, unknown>
 ): Record<string, unknown> {
   return {
-    // Spec state preserved under /state/ key
+    // Spec state spread at root: /weather/hourly works (json-render convention)
+    ...(specState ?? {}),
+    // Backward compat: /state/weather/hourly also works
     state: specState ?? {},
-    // Tool results
+    // Tool results at /tools/{id}
     tools: toolResults,
-    // Transform outputs
+    // Transform outputs at /tx/{key} — overrides raw tx definitions from specState
     tx: txOutputs,
   };
 }

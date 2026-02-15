@@ -48,6 +48,8 @@ export interface ChatMessageProps {
   id: string;
   role: "user" | "assistant";
   parts: Part[];
+  /** Accumulated tool results from all prior messages in the conversation */
+  accumulatedToolResults?: Record<string, unknown>;
   isStreaming?: boolean;
   viewMode?: ViewMode;
   /** Callback to send a follow-up message to the AI agent (e.g. error fix request) */
@@ -62,6 +64,7 @@ export function ChatMessage({
   id,
   role,
   parts,
+  accumulatedToolResults,
   isStreaming,
   viewMode = "preview",
   onRequestFix,
@@ -111,16 +114,20 @@ export function ChatMessage({
   const hasText = !!(text && text.trim().length > 0);
   const showPreview = viewMode === "preview" || viewMode === "split";
   const showRaw = viewMode === "raw" || viewMode === "split";
+  const showState = viewMode === "state";
 
   return (
     <div className="group/msg flex flex-col items-start gap-1">
       <div
         className={cn(
           "space-y-3 w-full",
-          viewMode === "split" ? "max-w-full" : !hasSpec ? "max-w-[80%]" : "max-w-[90%]"
+          viewMode === "split" || showState ? "max-w-full" : !hasSpec ? "max-w-[80%]" : "max-w-[90%]"
         )}
       >
-        {viewMode === "split" ? (
+        {showState ? (
+          /* ─── State Debug View ─── */
+          <StateView spec={spec} parts={parts} accumulatedToolResults={accumulatedToolResults} />
+        ) : viewMode === "split" ? (
           /* ─── Split View ─── */
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-3">
@@ -131,6 +138,7 @@ export function ChatMessage({
                 hasSpec={hasSpec}
                 spec={spec}
                 parts={parts}
+                accumulatedToolResults={accumulatedToolResults}
                 isStreaming={isStreaming}
                 activeToolCalls={activeToolCalls}
                 onRequestFix={onRequestFix}
@@ -152,6 +160,7 @@ export function ChatMessage({
             hasSpec={hasSpec}
             spec={spec}
             parts={parts}
+            accumulatedToolResults={accumulatedToolResults}
             isStreaming={isStreaming}
             activeToolCalls={activeToolCalls}
             onRequestFix={onRequestFix}
@@ -288,10 +297,16 @@ function computePartsFingerprint(parts: Part[]): string {
   return fp;
 }
 
+/** Extended resolution result that also exposes the state model for debugging. */
+interface ExtendedResolutionResult extends ResolutionResult {
+  stateModel: Record<string, unknown> | null;
+}
+
 function useResolvedSpec(
   spec: Spec | null,
-  parts: Part[]
-): ResolutionResult {
+  parts: Part[],
+  accumulatedToolResults?: Record<string, unknown>
+): ExtendedResolutionResult {
   // Derive a stable fingerprint — same string = same tool results, skip recompute.
   // This avoids re-running the expensive pipeline when the parent re-renders
   // with a new `parts` array reference that has identical content.
@@ -308,13 +323,14 @@ function useResolvedSpec(
   const stableSpec = stableSpecRef.current.spec;
 
   return useMemo(() => {
-    if (!stableSpec) return { spec: null, errors: [] };
+    if (!stableSpec) return { spec: null, errors: [], stateModel: null };
 
     try {
       const allErrors: StateError[] = [];
 
-      // 1. Extract tool results from message parts
-      const toolResults = extractToolResults(parts as ToolInvocationPart[]);
+      // 1. Extract tool results from message parts, merged with accumulated results
+      const currentToolResults = extractToolResults(parts as ToolInvocationPart[]);
+      const toolResults = { ...(accumulatedToolResults ?? {}), ...currentToolResults };
 
       // 2. Extract transform definitions from spec's state tree
       const specState = (stableSpec as unknown as Record<string, unknown>).state as
@@ -347,11 +363,12 @@ function useResolvedSpec(
       const propTypeErrors = validateResolvedProps(resolvedSpec);
       allErrors.push(...propTypeErrors);
 
-      return { spec: resolvedSpec, errors: allErrors };
+      return { spec: resolvedSpec, errors: allErrors, stateModel };
     } catch (err) {
       console.error("State resolution error:", err);
       return {
         spec: stableSpec,
+        stateModel: null,
         errors: [
           {
             type: "transform-error" as const,
@@ -363,7 +380,7 @@ function useResolvedSpec(
       };
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps -- stableSpec+partsFingerprint are stable proxies
-  }, [stableSpec, partsFingerprint]);
+  }, [stableSpec, partsFingerprint, accumulatedToolResults]);
 }
 
 /** The rendered preview — extracted from the original ChatMessage body */
@@ -373,6 +390,7 @@ function PreviewContent({
   hasSpec,
   spec,
   parts,
+  accumulatedToolResults,
   isStreaming,
   activeToolCalls,
   onRequestFix,
@@ -382,12 +400,13 @@ function PreviewContent({
   hasSpec: boolean;
   spec: Spec | null;
   parts: Part[];
+  accumulatedToolResults?: Record<string, unknown>;
   isStreaming?: boolean;
   activeToolCalls: Part[];
   onRequestFix?: (text: string) => void;
 }) {
   // Resolve $state references and compute transforms
-  const { spec: resolvedSpec, errors } = useResolvedSpec(spec, parts);
+  const { spec: resolvedSpec, errors } = useResolvedSpec(spec, parts, accumulatedToolResults);
 
   // Only show errors when not streaming (errors during streaming are transient)
   const visibleErrors = !isStreaming ? errors : [];
@@ -690,6 +709,436 @@ function RawPart({
       )}
     </div>
   );
+}
+
+/** Wrapper that hooks into useResolvedSpec and renders StateContent */
+function StateView({ spec, parts, accumulatedToolResults }: { spec: Spec | null; parts: Part[]; accumulatedToolResults?: Record<string, unknown> }) {
+  const { errors, stateModel } = useResolvedSpec(spec, parts, accumulatedToolResults);
+
+  return (
+    <StateContent
+      spec={spec}
+      parts={parts}
+      errors={errors}
+      stateModel={stateModel}
+    />
+  );
+}
+
+/* ────────────────────────────────────────────────────────────────────
+ * State Debug View
+ * ──────────────────────────────────────────────────────────────────── */
+
+/** State debug view — shows the accumulated state model with expandable paths */
+function StateContent({
+  spec,
+  parts,
+  errors,
+  stateModel,
+}: {
+  spec: Spec | null;
+  parts: Part[];
+  errors: StateError[];
+  stateModel: Record<string, unknown> | null;
+}) {
+  const [filter, setFilter] = useState("");
+
+  // Also show tool results at a glance even when no spec
+  const toolResults = useMemo(
+    () => extractToolResults(parts as ToolInvocationPart[]),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [computePartsFingerprint(parts)]
+  );
+
+  const hasToolResults = Object.keys(toolResults).length > 0;
+
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/30 overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-zinc-800/50 bg-zinc-900/50">
+        <span className="text-[10px] font-semibold uppercase tracking-widest text-zinc-500">
+          State Model
+        </span>
+        <span className="text-[10px] text-zinc-600">
+          (paths usable with <code className="text-teal-500/70">{"$state"}</code>)
+        </span>
+        <div className="flex-1" />
+        <input
+          type="text"
+          placeholder="Filter paths…"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          className="text-[11px] bg-zinc-950/60 border border-zinc-800 rounded px-2 py-0.5 text-zinc-400 placeholder:text-zinc-700 w-40 focus:outline-none focus:border-zinc-600"
+        />
+      </div>
+
+      {/* Errors summary */}
+      {errors.length > 0 && (
+        <div className="px-3 py-2 border-b border-amber-500/20 bg-amber-500/5">
+          <div className="text-[10px] font-semibold text-amber-400 mb-1">
+            {errors.length} error{errors.length !== 1 ? "s" : ""}
+          </div>
+          {errors.map((err, i) => (
+            <div key={i} className="text-[11px] font-mono text-amber-300/80 leading-relaxed">
+              <span className="text-amber-500/60">[{err.type}]</span> {err.message}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* State tree */}
+      {stateModel ? (
+        <div className="divide-y divide-zinc-800/30">
+          {/* Spec state keys (everything except reserved keys) */}
+          {Object.entries(stateModel as Record<string, unknown>)
+            .filter(([key]) => key !== "state" && key !== "tools" && key !== "tx")
+            .map(([key]) => (
+              <StateTreeSection
+                key={key}
+                title={`/${key}`}
+                path={`/${key}`}
+                data={(stateModel as Record<string, unknown>)[key]}
+                filter={filter}
+                defaultExpanded
+                badgeColor="bg-purple-500/15 text-purple-400"
+              />
+            ))}
+          {/* Show empty hint if no spec state keys exist */}
+          {Object.keys(stateModel as Record<string, unknown>)
+            .filter((key) => key !== "state" && key !== "tools" && key !== "tx")
+            .length === 0 && (
+            <div className="px-3 py-1.5 text-[10px] text-zinc-600 italic">
+              No spec state data
+            </div>
+          )}
+          <StateTreeSection
+            title="/tools"
+            path="/tools"
+            data={(stateModel as Record<string, unknown>).tools}
+            filter={filter}
+            defaultExpanded
+            badgeColor="bg-emerald-500/15 text-emerald-400"
+          />
+          <StateTreeSection
+            title="/tx"
+            path="/tx"
+            data={(stateModel as Record<string, unknown>).tx}
+            filter={filter}
+            defaultExpanded
+            badgeColor="bg-amber-500/15 text-amber-400"
+          />
+        </div>
+      ) : hasToolResults ? (
+        /* Fallback: no spec yet, but we have tool results */
+        <div className="p-3 space-y-2">
+          <div className="text-[10px] text-zinc-600 italic mb-2">
+            No spec received yet. Showing raw tool results:
+          </div>
+          <StateTreeSection
+            title="/tools"
+            path="/tools"
+            data={toolResults}
+            filter={filter}
+            defaultExpanded
+            badgeColor="bg-emerald-500/15 text-emerald-400"
+          />
+        </div>
+      ) : (
+        <div className="px-4 py-6 text-center">
+          <div className="text-xs text-zinc-600 italic">
+            No state data yet — waiting for tool results and spec.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A collapsible section in the state tree (e.g. /state, /tools, /tx) */
+function StateTreeSection({
+  title,
+  path,
+  data,
+  filter,
+  defaultExpanded = false,
+  badgeColor,
+}: {
+  title: string;
+  path: string;
+  data: unknown;
+  filter: string;
+  defaultExpanded?: boolean;
+  badgeColor: string;
+}) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
+
+  const isEmpty =
+    data === undefined ||
+    data === null ||
+    (typeof data === "object" && Object.keys(data as Record<string, unknown>).length === 0);
+
+  return (
+    <div>
+      <button
+        className="flex items-center gap-2 w-full px-3 py-1.5 text-left hover:bg-zinc-800/30 transition-colors"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span className="text-zinc-600 text-xs shrink-0">
+          {expanded ? "▾" : "▸"}
+        </span>
+        <span className={cn("shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider", badgeColor)}>
+          {title}
+        </span>
+        {isEmpty && (
+          <span className="text-[10px] text-zinc-700 italic">empty</span>
+        )}
+        {!isEmpty && !expanded && (
+          <span className="text-[10px] text-zinc-600 font-mono truncate">
+            {summarizeStateValue(data)}
+          </span>
+        )}
+      </button>
+
+      {expanded && !isEmpty && (
+        <div className="pl-4 pr-3 pb-2">
+          <StateNode path={path} data={data} filter={filter} depth={0} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Recursive tree node for displaying a state value with its path */
+function StateNode({
+  path,
+  data,
+  filter,
+  depth,
+}: {
+  path: string;
+  data: unknown;
+  filter: string;
+  depth: number;
+}) {
+  const [expanded, setExpanded] = useState(depth < 2);
+
+  // Filter check: does this path or any child match?
+  const matchesFilter =
+    !filter || path.toLowerCase().includes(filter.toLowerCase());
+
+  if (!matchesFilter && typeof data !== "object") return null;
+
+  // Leaf value
+  if (data === null || data === undefined || typeof data !== "object") {
+    return (
+      <div className="flex items-baseline gap-2 py-0.5 group/node">
+        <CopyablePath path={path} />
+        <span className="text-[11px] font-mono text-zinc-500">
+          {renderLeafValue(data)}
+        </span>
+      </div>
+    );
+  }
+
+  // Array
+  if (Array.isArray(data)) {
+    return (
+      <div>
+        <button
+          className="flex items-baseline gap-2 py-0.5 group/node hover:bg-zinc-800/20 rounded px-1 -mx-1 w-full text-left"
+          onClick={() => setExpanded((v) => !v)}
+        >
+          <span className="text-zinc-600 text-[10px] shrink-0">
+            {expanded ? "▾" : "▸"}
+          </span>
+          <CopyablePath path={path} />
+          <span className="text-[10px] font-mono text-teal-600">
+            array[{data.length}]
+          </span>
+        </button>
+        {expanded && (
+          <div className="ml-3 border-l border-zinc-800/40 pl-2">
+            {data.length <= 5 ? (
+              data.map((item, i) => (
+                <StateNode
+                  key={i}
+                  path={`${path}/${i}`}
+                  data={item}
+                  filter={filter}
+                  depth={depth + 1}
+                />
+              ))
+            ) : (
+              <ArrayPreview path={path} data={data} filter={filter} depth={depth} />
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Object
+  const entries = Object.entries(data as Record<string, unknown>);
+  return (
+    <div>
+      <button
+        className="flex items-baseline gap-2 py-0.5 group/node hover:bg-zinc-800/20 rounded px-1 -mx-1 w-full text-left"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span className="text-zinc-600 text-[10px] shrink-0">
+          {expanded ? "▾" : "▸"}
+        </span>
+        <CopyablePath path={path} />
+        <span className="text-[10px] font-mono text-zinc-600">
+          {"{"}
+          {entries.length} key{entries.length !== 1 ? "s" : ""}
+          {"}"}
+        </span>
+      </button>
+      {expanded && (
+        <div className="ml-3 border-l border-zinc-800/40 pl-2">
+          {entries.map(([key, value]) => (
+            <StateNode
+              key={key}
+              path={`${path}/${key}`}
+              data={value}
+              filter={filter}
+              depth={depth + 1}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Show first/last items of a large array with a "… N more" indicator */
+function ArrayPreview({
+  path,
+  data,
+  filter,
+  depth,
+}: {
+  path: string;
+  data: unknown[];
+  filter: string;
+  depth: number;
+}) {
+  const [showAll, setShowAll] = useState(false);
+
+  if (showAll) {
+    return (
+      <>
+        {data.map((item, i) => (
+          <StateNode
+            key={i}
+            path={`${path}/${i}`}
+            data={item}
+            filter={filter}
+            depth={depth + 1}
+          />
+        ))}
+        <button
+          onClick={() => setShowAll(false)}
+          className="text-[10px] text-zinc-600 hover:text-zinc-400 py-0.5 pl-1"
+        >
+          Collapse
+        </button>
+      </>
+    );
+  }
+
+  const HEAD = 2;
+  const TAIL = 1;
+  const hidden = data.length - HEAD - TAIL;
+
+  return (
+    <>
+      {data.slice(0, HEAD).map((item, i) => (
+        <StateNode
+          key={i}
+          path={`${path}/${i}`}
+          data={item}
+          filter={filter}
+          depth={depth + 1}
+        />
+      ))}
+      {hidden > 0 && (
+        <button
+          onClick={() => setShowAll(true)}
+          className="text-[10px] text-zinc-600 hover:text-zinc-400 py-0.5 pl-1 italic"
+        >
+          … {hidden} more items …
+        </button>
+      )}
+      {data.slice(-TAIL).map((item, i) => (
+        <StateNode
+          key={data.length - TAIL + i}
+          path={`${path}/${data.length - TAIL + i}`}
+          data={item}
+          filter={filter}
+          depth={depth + 1}
+        />
+      ))}
+    </>
+  );
+}
+
+/** Clickable path that copies to clipboard */
+function CopyablePath({ path }: { path: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(`"${path}"`).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+      });
+    },
+    [path]
+  );
+
+  return (
+    <span
+      onClick={handleCopy}
+      className="text-[11px] font-mono text-teal-500/70 hover:text-teal-400 cursor-pointer shrink-0 select-all"
+      title={`Click to copy: "${path}"`}
+    >
+      {copied ? (
+        <span className="text-green-400">copied!</span>
+      ) : (
+        path.split("/").slice(-1)[0] || path
+      )}
+    </span>
+  );
+}
+
+/** Render a leaf value with appropriate coloring */
+function renderLeafValue(value: unknown): React.ReactNode {
+  if (value === null) return <span className="text-zinc-600">null</span>;
+  if (value === undefined) return <span className="text-zinc-700">undefined</span>;
+  if (typeof value === "string") {
+    const display = value.length > 100 ? value.slice(0, 100) + "…" : value;
+    return <span className="text-green-500/70">&quot;{display}&quot;</span>;
+  }
+  if (typeof value === "number") return <span className="text-blue-400/70">{value}</span>;
+  if (typeof value === "boolean")
+    return <span className="text-amber-400/70">{String(value)}</span>;
+  return <span className="text-zinc-500">{String(value)}</span>;
+}
+
+/** Quick summary of a state value (used in collapsed headers) */
+function summarizeStateValue(data: unknown): string {
+  if (data === null || data === undefined) return "null";
+  if (Array.isArray(data)) return `[${data.length} items]`;
+  if (typeof data === "object") {
+    const keys = Object.keys(data as Record<string, unknown>);
+    if (keys.length === 0) return "{}";
+    if (keys.length <= 4) return `{ ${keys.join(", ")} }`;
+    return `{ ${keys.slice(0, 3).join(", ")}, +${keys.length - 3} }`;
+  }
+  return truncate(String(data), 60);
 }
 
 /** Color coding for different part types */
