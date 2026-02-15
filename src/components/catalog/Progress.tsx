@@ -2,6 +2,7 @@
 
 import type { ComponentRenderProps } from "@json-render/react";
 import { cn } from "@/lib/cn";
+import { ComponentError, ErrorCode } from "./ComponentError";
 
 interface ProgressProps {
   value: number;
@@ -10,8 +11,33 @@ interface ProgressProps {
 }
 
 export function Progress({ element }: ComponentRenderProps<ProgressProps>) {
-  const { value, label, variant = "default" } = element.props;
-  const clamped = Math.max(0, Math.min(100, value));
+  const { value: rawValue, label, variant = "default" } = element.props;
+
+  // Coerce value: AI may send "75" as a string
+  const numValue =
+    typeof rawValue === "number"
+      ? rawValue
+      : typeof rawValue === "string"
+        ? parseFloat(rawValue)
+        : NaN;
+
+  if (rawValue === undefined || rawValue === null || isNaN(numValue)) {
+    return (
+      <ComponentError
+        component="Progress"
+        errorType="invalid value"
+        message={
+          <>
+            Expected a numeric <ErrorCode>value</ErrorCode> (0–100), got{" "}
+            <ErrorCode>{JSON.stringify(rawValue)}</ErrorCode> ({typeof rawValue}
+            ).
+          </>
+        }
+      />
+    );
+  }
+
+  const clamped = Math.max(0, Math.min(100, numValue));
 
   return (
     <div className="w-full">

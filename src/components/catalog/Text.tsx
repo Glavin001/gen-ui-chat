@@ -6,6 +6,7 @@ import { Streamdown } from "streamdown";
 import { code } from "@streamdown/code";
 import { math } from "@streamdown/math";
 import { cjk } from "@streamdown/cjk";
+import { ComponentError, ErrorCode } from "./ComponentError";
 
 interface TextProps {
   content: string;
@@ -15,10 +16,33 @@ interface TextProps {
 export function Text({ element }: ComponentRenderProps<TextProps>) {
   const { content, variant = "body" } = element.props;
 
+  // Guard: missing or wrong-type content
+  if (content === undefined || content === null) {
+    return (
+      <ComponentError
+        component="Text"
+        errorType="missing content"
+        message={
+          <>
+            The <ErrorCode>content</ErrorCode> prop is required.
+          </>
+        }
+      />
+    );
+  }
+
+  // Coerce non-string content (AI might pass a number or object)
+  const text =
+    typeof content === "string"
+      ? content
+      : typeof content === "object"
+        ? JSON.stringify(content, null, 2)
+        : String(content);
+
   if (variant === "code") {
     return (
       <code className="px-1.5 py-0.5 bg-zinc-800 rounded text-sm font-mono text-emerald-400">
-        {content}
+        {text}
       </code>
     );
   }
@@ -32,7 +56,7 @@ export function Text({ element }: ComponentRenderProps<TextProps>) {
       )}
     >
       <Streamdown plugins={{ code, math, cjk }}>
-        {content}
+        {text}
       </Streamdown>
     </div>
   );

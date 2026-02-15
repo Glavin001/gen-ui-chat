@@ -1,14 +1,15 @@
 "use client";
 
 import { useChat } from "@ai-sdk/react";
-import { useRef, useEffect, useState } from "react";
+import { useRef, useEffect, useState, useCallback } from "react";
 import { ChatMessage } from "./ChatMessage";
 import { ChatInput } from "./ChatInput";
 import { ViewModeToggle, type ViewMode } from "./ViewModeToggle";
 
 export function ChatApp() {
   // AI SDK v6: useChat defaults to DefaultChatTransport with api="/api/chat"
-  const { messages, status, sendMessage, stop } = useChat();
+  const { messages, status, sendMessage, stop, regenerate, setMessages } =
+    useChat();
 
   const isStreaming = status === "streaming" || status === "submitted";
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -25,6 +26,36 @@ export function ChatApp() {
   const handleSend = (text: string) => {
     sendMessage({ text });
   };
+
+  const handleRetry = useCallback(
+    (messageId: string) => {
+      regenerate({ messageId });
+    },
+    [regenerate]
+  );
+
+  const handleRemove = useCallback(
+    (messageId: string) => {
+      setMessages((prev) => {
+        const idx = prev.findIndex((m) => m.id === messageId);
+        if (idx === -1) return prev;
+        // If removing a user message, also remove the following assistant response
+        if (prev[idx].role === "user") {
+          const next = [...prev];
+          // Remove user message and any immediately following assistant message
+          const removeCount =
+            idx + 1 < next.length && next[idx + 1].role === "assistant"
+              ? 2
+              : 1;
+          next.splice(idx, removeCount);
+          return next;
+        }
+        // If removing an assistant message, just remove it
+        return prev.filter((m) => m.id !== messageId);
+      });
+    },
+    [setMessages]
+  );
 
   return (
     <div className="flex h-screen flex-col">
@@ -53,10 +84,14 @@ export function ChatApp() {
             return (
               <ChatMessage
                 key={msg.id}
+                id={msg.id}
                 role={msg.role as "user" | "assistant"}
                 parts={msg.parts}
                 isStreaming={isLastAssistant && isStreaming}
                 viewMode={viewMode}
+                onRequestFix={handleSend}
+                onRetry={handleRetry}
+                onRemove={handleRemove}
               />
             );
           })}

@@ -1,5 +1,6 @@
 "use client";
 
+import React from "react";
 import type { ComponentRenderProps } from "@json-render/react";
 import {
   PieChart as RechartsPieChart,
@@ -9,6 +10,8 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
+import { ChartWrapper } from "./ChartWrapper";
+import { ComponentError, ErrorCode } from "./ComponentError";
 
 const DEFAULT_COLORS = [
   "#6366f1",
@@ -34,47 +37,89 @@ interface PieChartProps {
   showLabels?: boolean;
 }
 
-export function PieChartComponent({
-  element,
-}: ComponentRenderProps<PieChartProps>) {
-  const { data, title, height = 300, showLabels = true } = element.props;
+/**
+ * Coerce data items: ensure `value` is numeric (AI may send strings).
+ * Filter out items that can't be coerced.
+ */
+function coercePieData(data: PieChartDataItem[]): PieChartDataItem[] {
+  return data
+    .map((item) => ({
+      ...item,
+      name: String(item.name ?? "Unknown"),
+      value:
+        typeof item.value === "number"
+          ? item.value
+          : parseFloat(String(item.value)),
+    }))
+    .filter((item) => !isNaN(item.value) && item.value > 0);
+}
 
-  if (!data?.length) {
+const MemoizedPieChart = React.memo(function MemoizedPieChart({
+  data,
+  title,
+  height,
+  showLabels,
+}: {
+  data: PieChartDataItem[];
+  title?: string;
+  height: number;
+  showLabels: boolean;
+}) {
+  // Coerce data to ensure numeric values
+  const safeData = coercePieData(data);
+
+  if (safeData.length === 0) {
     return (
-      <div className="rounded-xl border border-zinc-800 p-4 text-sm text-zinc-500 animate-pulse" style={{ height }}>
-        Loading chart...
-      </div>
+      <ComponentError
+        component="PieChart"
+        errorType="no valid data"
+        minHeight={height}
+        message={
+          <>
+            All data items had non-numeric or zero values. Each item needs a
+            numeric <ErrorCode>value</ErrorCode> greater than 0.
+          </>
+        }
+      />
     );
   }
 
+  // Calculate responsive radii based on available height
+  // Leave room for title (~24px), legend (~30px), and padding
+  const chartArea = height - (title ? 24 : 0) - 40;
+  const outerRadius = Math.max(40, Math.floor(chartArea / 2.5));
+  const innerRadius = Math.max(20, Math.floor(outerRadius * 0.6));
+
   return (
-    <div className="w-full">
+    <>
       {title && (
         <p className="text-sm font-medium text-zinc-300 mb-2">{title}</p>
       )}
-      <ResponsiveContainer width="100%" height={height}>
+      <ResponsiveContainer width="100%" height={height - (title ? 24 : 0)}>
         <RechartsPieChart>
           <Pie
-            data={data}
+            data={safeData}
             cx="50%"
             cy="50%"
-            innerRadius={60}
-            outerRadius={90}
+            innerRadius={innerRadius}
+            outerRadius={outerRadius}
             paddingAngle={3}
             dataKey="value"
             nameKey="name"
             label={
-              showLabels
-                ? ({ name, percent }) =>
+              showLabels && safeData.length <= 8
+                ? ({ name, percent }: { name: string; percent: number }) =>
                     `${name} ${(percent * 100).toFixed(0)}%`
                 : false
             }
-            labelLine={showLabels}
+            labelLine={showLabels && safeData.length <= 8}
           >
-            {data.map((entry, index) => (
+            {safeData.map((entry, index) => (
               <Cell
                 key={`cell-${index}`}
-                fill={entry.color ?? DEFAULT_COLORS[index % DEFAULT_COLORS.length]}
+                fill={
+                  entry.color ?? DEFAULT_COLORS[index % DEFAULT_COLORS.length]
+                }
               />
             ))}
           </Pie>
@@ -90,6 +135,40 @@ export function PieChartComponent({
           <Legend wrapperStyle={{ fontSize: 12, color: "#a1a1aa" }} />
         </RechartsPieChart>
       </ResponsiveContainer>
-    </div>
+    </>
+  );
+});
+
+export function PieChartComponent({
+  element,
+}: ComponentRenderProps<PieChartProps>) {
+  const {
+    data,
+    title,
+    height: rawHeight = 300,
+    showLabels = true,
+  } = element.props;
+
+  const height =
+    typeof rawHeight === "string"
+      ? parseInt(rawHeight, 10) || 300
+      : (rawHeight ?? 300);
+
+  return (
+    <ChartWrapper
+      chartType="PieChart"
+      dataPropName="data"
+      data={data}
+      height={height}
+      hasRequiredProps={true}
+      diagnostics={{ itemCount: Array.isArray(data) ? data.length : undefined }}
+    >
+      <MemoizedPieChart
+        data={data as PieChartDataItem[]}
+        title={title}
+        height={height}
+        showLabels={showLabels}
+      />
+    </ChartWrapper>
   );
 }

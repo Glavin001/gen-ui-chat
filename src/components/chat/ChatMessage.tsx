@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useMemo, useState, useCallback } from "react";
+import React, { useMemo, useState, useCallback, useEffect, useRef } from "react";
 import {
   Renderer,
   JSONUIProvider,
@@ -19,9 +19,13 @@ import {
   computeTransforms,
   buildStateModel,
   resolveSpecState,
+  validateResolvedProps,
   type ToolInvocationPart,
+  type StateError,
+  type ResolutionResult,
 } from "@/lib/state-resolver";
 import { InProcessSandbox } from "@/lib/reactive-store";
+import { ErrorContextProvider } from "@/components/catalog/ErrorContext";
 import { Streamdown } from "streamdown";
 import { code } from "@streamdown/code";
 import { math } from "@streamdown/math";
@@ -41,17 +45,28 @@ interface Part {
 }
 
 export interface ChatMessageProps {
+  id: string;
   role: "user" | "assistant";
   parts: Part[];
   isStreaming?: boolean;
   viewMode?: ViewMode;
+  /** Callback to send a follow-up message to the AI agent (e.g. error fix request) */
+  onRequestFix?: (text: string) => void;
+  /** Callback to retry/regenerate a specific message */
+  onRetry?: (messageId: string) => void;
+  /** Callback to remove a specific message */
+  onRemove?: (messageId: string) => void;
 }
 
 export function ChatMessage({
+  id,
   role,
   parts,
   isStreaming,
   viewMode = "preview",
+  onRequestFix,
+  onRetry,
+  onRemove,
 }: ChatMessageProps) {
   // Use json-render's hook to extract specs from parts (handles "data-spec" parts)
   const jsonRenderResult = useJsonRenderMessage(parts as DataPart[]);
@@ -77,10 +92,17 @@ export function ChatMessage({
       .join("\n");
 
     return (
-      <div className="flex justify-end">
+      <div className="group/msg flex flex-col items-end gap-1">
         <div className="max-w-[80%] rounded-2xl rounded-br-md bg-indigo-600 px-4 py-2.5 text-sm text-white whitespace-pre-wrap">
           {userText}
         </div>
+        <MessageActions
+          messageId={id}
+          role="user"
+          onRetry={onRetry}
+          onRemove={onRemove}
+          isStreaming={isStreaming}
+        />
       </div>
     );
   }
@@ -91,7 +113,7 @@ export function ChatMessage({
   const showRaw = viewMode === "raw" || viewMode === "split";
 
   return (
-    <div className="flex justify-start">
+    <div className="group/msg flex flex-col items-start gap-1">
       <div
         className={cn(
           "space-y-3 w-full",
@@ -111,6 +133,7 @@ export function ChatMessage({
                 parts={parts}
                 isStreaming={isStreaming}
                 activeToolCalls={activeToolCalls}
+                onRequestFix={onRequestFix}
               />
             </div>
             <div className="space-y-3">
@@ -131,9 +154,17 @@ export function ChatMessage({
             parts={parts}
             isStreaming={isStreaming}
             activeToolCalls={activeToolCalls}
+            onRequestFix={onRequestFix}
           />
         )}
       </div>
+      <MessageActions
+        messageId={id}
+        role="assistant"
+        onRetry={onRetry}
+        onRemove={onRemove}
+        isStreaming={isStreaming}
+      />
     </div>
   );
 }
@@ -150,6 +181,71 @@ function SplitLabel({ label }: { label: string }) {
   );
 }
 
+/** Hover-revealed action buttons for retry and remove */
+function MessageActions({
+  messageId,
+  role,
+  onRetry,
+  onRemove,
+  isStreaming,
+}: {
+  messageId: string;
+  role: "user" | "assistant";
+  onRetry?: (messageId: string) => void;
+  onRemove?: (messageId: string) => void;
+  isStreaming?: boolean;
+}) {
+  // Don't show actions while streaming
+  if (isStreaming) return null;
+
+  return (
+    <div className="flex items-center gap-1 opacity-0 group-hover/msg:opacity-100 transition-opacity duration-150">
+      {onRetry && (
+        <button
+          onClick={() => onRetry(messageId)}
+          className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors"
+          title={role === "user" ? "Retry from here" : "Regenerate response"}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 16 16"
+            fill="currentColor"
+            className="w-3 h-3"
+          >
+            <path
+              fillRule="evenodd"
+              d="M13.836 2.477a.75.75 0 0 1 .75.75v3.182a.75.75 0 0 1-.75.75h-3.182a.75.75 0 0 1 0-1.5h1.37l-.84-.841a4.5 4.5 0 0 0-7.08.681.75.75 0 0 1-1.3-.75 6 6 0 0 1 9.44-.908l.84.84V3.227a.75.75 0 0 1 .75-.75Zm-.911 7.5A.75.75 0 0 1 13.199 11a6 6 0 0 1-9.44.908l-.84-.84v1.456a.75.75 0 0 1-1.5 0V9.342a.75.75 0 0 1 .75-.75h3.182a.75.75 0 0 1 0 1.5H3.98l.841.841a4.5 4.5 0 0 0 7.08-.681.75.75 0 0 1 1.025-.274Z"
+              clipRule="evenodd"
+            />
+          </svg>
+          <span>{role === "user" ? "Retry" : "Regenerate"}</span>
+        </button>
+      )}
+      {onRemove && (
+        <button
+          onClick={() => onRemove(messageId)}
+          className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-zinc-500 hover:text-red-400 hover:bg-zinc-800 transition-colors"
+          title="Remove message"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 16 16"
+            fill="currentColor"
+            className="w-3 h-3"
+          >
+            <path
+              fillRule="evenodd"
+              d="M5 3.25V4H2.75a.75.75 0 0 0 0 1.5h.3l.815 8.15A1.5 1.5 0 0 0 5.357 15h5.285a1.5 1.5 0 0 0 1.493-1.35l.815-8.15h.3a.75.75 0 0 0 0-1.5H11v-.75A2.25 2.25 0 0 0 8.75 1h-1.5A2.25 2.25 0 0 0 5 3.25Zm2.25-.75a.75.75 0 0 0-.75.75V4h3v-.75a.75.75 0 0 0-.75-.75h-1.5ZM6.05 6a.75.75 0 0 1 .787.713l.275 5.5a.75.75 0 0 1-1.498.075l-.275-5.5A.75.75 0 0 1 6.05 6Zm3.9 0a.75.75 0 0 1 .712.787l-.275 5.5a.75.75 0 0 1-1.498-.075l.275-5.5A.75.75 0 0 1 9.95 6Z"
+              clipRule="evenodd"
+            />
+          </svg>
+          <span>Remove</span>
+        </button>
+      )}
+    </div>
+  );
+}
+
 // Singleton sandbox for transform execution (shared across all messages)
 const sandbox = new InProcessSandbox();
 
@@ -160,20 +256,68 @@ const sandbox = new InProcessSandbox();
  * 2. Detects transform definitions in spec state at /state/tx/{key}
  * 3. Runs transforms in sandbox → outputs at /tx/{key}
  * 4. Resolves all { $state: "/path" } refs in element props
+ *
+ * Returns both the resolved spec and any errors encountered.
  */
+/** Max auto-fix attempts per session (prevents infinite error→fix→error loops) */
+const MAX_AUTO_FIX_ATTEMPTS = 2;
+let _autoFixCount = 0;
+
+/**
+ * Compute a cheap fingerprint from parts that captures tool result availability.
+ * This changes when: parts count changes, tool results arrive, or tool state transitions.
+ * Much cheaper than deep-comparing the entire parts array on every render.
+ */
+function computePartsFingerprint(parts: Part[]): string {
+  let fp = `${parts.length}:`;
+  for (const p of parts) {
+    if ((p.type === "tool-invocation" || p.type === "tool-call") && p.toolInvocation) {
+      const inv = p.toolInvocation as { toolCallId?: string; toolName: string; state: string };
+      fp += `${inv.toolCallId ?? inv.toolName}=${inv.state},`;
+    } else if (
+      p.type.startsWith("tool-") &&
+      p.type !== "tool-invocation" &&
+      p.type !== "tool-call" &&
+      p.type !== "tool-result"
+    ) {
+      // AI SDK v6 format: type is "tool-{toolName}"
+      const v6 = p as unknown as { toolCallId?: string; state?: string };
+      fp += `${v6.toolCallId ?? p.type}=${v6.state ?? "?"},`;
+    }
+  }
+  return fp;
+}
+
 function useResolvedSpec(
   spec: Spec | null,
   parts: Part[]
-): Spec | null {
+): ResolutionResult {
+  // Derive a stable fingerprint — same string = same tool results, skip recompute.
+  // This avoids re-running the expensive pipeline when the parent re-renders
+  // with a new `parts` array reference that has identical content.
+  const partsFingerprint = computePartsFingerprint(parts);
+
+  // Stabilize spec reference: useJsonRenderMessage may return a new object on
+  // every render even when the spec hasn't structurally changed.
+  // We compare via JSON fingerprint and only update the ref when it changes.
+  const specFP = JSON.stringify(spec);
+  const stableSpecRef = useRef<{ fp: string; spec: Spec | null }>({ fp: "", spec: null });
+  if (specFP !== stableSpecRef.current.fp) {
+    stableSpecRef.current = { fp: specFP, spec };
+  }
+  const stableSpec = stableSpecRef.current.spec;
+
   return useMemo(() => {
-    if (!spec) return null;
+    if (!stableSpec) return { spec: null, errors: [] };
 
     try {
+      const allErrors: StateError[] = [];
+
       // 1. Extract tool results from message parts
       const toolResults = extractToolResults(parts as ToolInvocationPart[]);
 
       // 2. Extract transform definitions from spec's state tree
-      const specState = (spec as unknown as Record<string, unknown>).state as
+      const specState = (stableSpec as unknown as Record<string, unknown>).state as
         | Record<string, unknown>
         | undefined;
       const txDefs = extractTransformDefs(specState);
@@ -182,18 +326,44 @@ function useResolvedSpec(
       const baseState = buildStateModel(toolResults, specState, {});
 
       // 3. Compute transforms (may reference tool data via deps)
-      const txOutputs = computeTransforms(txDefs, baseState, sandbox);
+      const { outputs: txOutputs, errors: txErrors } = computeTransforms(
+        txDefs,
+        baseState,
+        sandbox
+      );
+      allErrors.push(...txErrors);
 
       // 4. Build final state model with transform outputs
       const stateModel = buildStateModel(toolResults, specState, txOutputs);
 
       // 5. Resolve all $state references in the spec
-      return resolveSpecState(spec, stateModel);
+      const { spec: resolvedSpec, errors: refErrors } = resolveSpecState(
+        stableSpec,
+        stateModel
+      );
+      allErrors.push(...refErrors);
+
+      // 6. Validate resolved prop types (e.g. data must be array for charts)
+      const propTypeErrors = validateResolvedProps(resolvedSpec);
+      allErrors.push(...propTypeErrors);
+
+      return { spec: resolvedSpec, errors: allErrors };
     } catch (err) {
       console.error("State resolution error:", err);
-      return spec; // Fall back to unresolved spec
+      return {
+        spec: stableSpec,
+        errors: [
+          {
+            type: "transform-error" as const,
+            key: "_pipeline",
+            message: `State resolution pipeline failed: ${err instanceof Error ? err.message : String(err)}`,
+            detail: err instanceof Error ? err.stack : undefined,
+          },
+        ],
+      };
     }
-  }, [spec, parts]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- stableSpec+partsFingerprint are stable proxies
+  }, [stableSpec, partsFingerprint]);
 }
 
 /** The rendered preview — extracted from the original ChatMessage body */
@@ -205,6 +375,7 @@ function PreviewContent({
   parts,
   isStreaming,
   activeToolCalls,
+  onRequestFix,
 }: {
   text: string | undefined;
   hasText: boolean;
@@ -213,9 +384,54 @@ function PreviewContent({
   parts: Part[];
   isStreaming?: boolean;
   activeToolCalls: Part[];
+  onRequestFix?: (text: string) => void;
 }) {
   // Resolve $state references and compute transforms
-  const resolvedSpec = useResolvedSpec(spec, parts);
+  const { spec: resolvedSpec, errors } = useResolvedSpec(spec, parts);
+
+  // Only show errors when not streaming (errors during streaming are transient)
+  const visibleErrors = !isStreaming ? errors : [];
+
+  // Auto-fix: when streaming finishes with errors, automatically send them
+  // back to the AI for correction (no user action required).
+  // Only fires for messages that were actively streaming (not pre-existing on page load).
+  // Limited to MAX_AUTO_FIX_ATTEMPTS per session to prevent infinite loops.
+  const wasStreamingRef = useRef(false);
+  const autoFixSentRef = useRef(false);
+  const hasVisibleErrors = visibleErrors.length > 0;
+  useEffect(() => {
+    if (isStreaming) {
+      wasStreamingRef.current = true;
+      autoFixSentRef.current = false;
+      return;
+    }
+    if (
+      wasStreamingRef.current &&
+      hasVisibleErrors &&
+      onRequestFix &&
+      !autoFixSentRef.current &&
+      _autoFixCount < MAX_AUTO_FIX_ATTEMPTS
+    ) {
+      autoFixSentRef.current = true;
+      _autoFixCount++;
+      const errorDetails = visibleErrors
+        .map((e) => {
+          let detail = `- ${e.message}`;
+          if (e.type === "transform-error" && e.fn) {
+            detail += `\n  Function: ${e.fn}`;
+          }
+          if (e.deps) {
+            detail += `\n  Dependencies: ${e.deps.join(", ")}`;
+          }
+          return detail;
+        })
+        .join("\n");
+
+      const message = `There are errors in the generated UI that need to be fixed:\n\n${errorDetails}\n\nPlease fix the transform functions and/or $state references to resolve these errors.`;
+      onRequestFix(message);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- visibleErrors used in closure but hasVisibleErrors is the stable dep
+  }, [isStreaming, hasVisibleErrors, onRequestFix]);
 
   return (
     <>
@@ -241,22 +457,29 @@ function PreviewContent({
         />
       ))}
 
+      {/* State resolution / transform errors */}
+      {visibleErrors.length > 0 && (
+        <StateErrorsDisplay errors={visibleErrors} onRequestFix={onRequestFix} />
+      )}
+
       {/* Rendered UI spec */}
       {hasSpec && resolvedSpec && (
         <div className="rounded-2xl bg-zinc-900/50 border border-zinc-800 p-4 overflow-hidden">
           <ErrorBoundary>
-            <JSONUIProvider registry={registry}>
-              <Renderer
-                spec={resolvedSpec}
-                registry={registry}
-                loading={isStreaming}
-                fallback={({ element }) => (
-                  <div className="rounded-lg bg-zinc-800/50 p-3 text-xs text-zinc-500">
-                    Unknown component: {element.type}
-                  </div>
-                )}
-              />
-            </JSONUIProvider>
+            <ErrorContextProvider value={onRequestFix ?? null}>
+              <JSONUIProvider registry={registry}>
+                <Renderer
+                  spec={resolvedSpec}
+                  registry={registry}
+                  loading={isStreaming}
+                  fallback={({ element }) => (
+                    <div className="rounded-lg bg-zinc-800/50 p-3 text-xs text-zinc-500">
+                      Unknown component: {element.type}
+                    </div>
+                  )}
+                />
+              </JSONUIProvider>
+            </ErrorContextProvider>
           </ErrorBoundary>
         </div>
       )}
@@ -275,6 +498,89 @@ function PreviewContent({
           </div>
         )}
     </>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────────────
+ * State Error Display
+ * ──────────────────────────────────────────────────────────────────── */
+
+/** Inline display of state resolution / transform errors with "Ask AI to fix" */
+function StateErrorsDisplay({
+  errors,
+  onRequestFix,
+}: {
+  errors: StateError[];
+  onRequestFix?: (text: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  const handleAskFix = useCallback(() => {
+    if (!onRequestFix) return;
+
+    // Build a detailed error message for the AI
+    const errorDetails = errors
+      .map((e) => {
+        let detail = `- ${e.message}`;
+        if (e.type === "transform-error" && e.fn) {
+          detail += `\n  Function: ${e.fn}`;
+        }
+        if (e.deps) {
+          detail += `\n  Dependencies: ${e.deps.join(", ")}`;
+        }
+        return detail;
+      })
+      .join("\n");
+
+    const message = `There are errors in the generated UI that need to be fixed:\n\n${errorDetails}\n\nPlease fix the transform functions and/or $state references to resolve these errors.`;
+    onRequestFix(message);
+  }, [errors, onRequestFix]);
+
+  return (
+    <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center gap-2 px-3 py-2">
+        <span className="text-amber-400 text-sm">&#9888;</span>
+        <span className="text-xs font-medium text-amber-300 flex-1">
+          {errors.length} data binding error{errors.length !== 1 ? "s" : ""}
+        </span>
+        <button
+          onClick={() => setExpanded((v) => !v)}
+          className="text-[10px] text-amber-400/70 hover:text-amber-300 transition-colors px-1.5 py-0.5 rounded"
+        >
+          {expanded ? "Hide details" : "Show details"}
+        </button>
+        {onRequestFix && (
+          <button
+            onClick={handleAskFix}
+            className="text-[10px] font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 px-2 py-1 rounded transition-colors"
+          >
+            Ask AI to fix
+          </button>
+        )}
+      </div>
+
+      {/* Error details */}
+      {expanded && (
+        <div className="border-t border-amber-500/20 px-3 py-2 space-y-2">
+          {errors.map((err, i) => (
+            <div key={i} className="text-xs space-y-0.5">
+              <div className="text-amber-300/90 font-mono">{err.message}</div>
+              {err.type === "transform-error" && err.fn && (
+                <pre className="text-amber-400/50 font-mono text-[10px] bg-amber-500/5 rounded p-1.5 overflow-x-auto">
+                  fn: {err.fn}
+                </pre>
+              )}
+              {err.deps && (
+                <div className="text-amber-400/50 font-mono text-[10px]">
+                  deps: {err.deps.join(", ")}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
