@@ -13,6 +13,20 @@ import { registry } from "@/lib/registry";
 import { ToolCallIndicator } from "./ToolCallIndicator";
 import { cn } from "@/lib/cn";
 import type { ViewMode } from "./ViewModeToggle";
+import {
+  extractToolResults,
+  extractTransformDefs,
+  computeTransforms,
+  buildStateModel,
+  resolveSpecState,
+  type ToolInvocationPart,
+} from "@/lib/state-resolver";
+import { InProcessSandbox } from "@/lib/reactive-store";
+import { Streamdown } from "streamdown";
+import { code } from "@streamdown/code";
+import { math } from "@streamdown/math";
+import { mermaid } from "@streamdown/mermaid";
+import { cjk } from "@streamdown/cjk";
 
 interface Part {
   type: string;
@@ -94,6 +108,7 @@ export function ChatMessage({
                 hasText={hasText}
                 hasSpec={hasSpec}
                 spec={spec}
+                parts={parts}
                 isStreaming={isStreaming}
                 activeToolCalls={activeToolCalls}
               />
@@ -113,6 +128,7 @@ export function ChatMessage({
             hasText={hasText}
             hasSpec={hasSpec}
             spec={spec}
+            parts={parts}
             isStreaming={isStreaming}
             activeToolCalls={activeToolCalls}
           />
@@ -134,12 +150,59 @@ function SplitLabel({ label }: { label: string }) {
   );
 }
 
+// Singleton sandbox for transform execution (shared across all messages)
+const sandbox = new InProcessSandbox();
+
+/**
+ * Hook: build a resolved spec by injecting tool results and computing transforms.
+ *
+ * 1. Extracts tool results from message parts → state at /tools/{toolName}
+ * 2. Detects transform definitions in spec state at /state/tx/{key}
+ * 3. Runs transforms in sandbox → outputs at /tx/{key}
+ * 4. Resolves all { $state: "/path" } refs in element props
+ */
+function useResolvedSpec(
+  spec: Spec | null,
+  parts: Part[]
+): Spec | null {
+  return useMemo(() => {
+    if (!spec) return null;
+
+    try {
+      // 1. Extract tool results from message parts
+      const toolResults = extractToolResults(parts as ToolInvocationPart[]);
+
+      // 2. Extract transform definitions from spec's state tree
+      const specState = (spec as unknown as Record<string, unknown>).state as
+        | Record<string, unknown>
+        | undefined;
+      const txDefs = extractTransformDefs(specState);
+
+      // Build initial state model (without transform outputs yet)
+      const baseState = buildStateModel(toolResults, specState, {});
+
+      // 3. Compute transforms (may reference tool data via deps)
+      const txOutputs = computeTransforms(txDefs, baseState, sandbox);
+
+      // 4. Build final state model with transform outputs
+      const stateModel = buildStateModel(toolResults, specState, txOutputs);
+
+      // 5. Resolve all $state references in the spec
+      return resolveSpecState(spec, stateModel);
+    } catch (err) {
+      console.error("State resolution error:", err);
+      return spec; // Fall back to unresolved spec
+    }
+  }, [spec, parts]);
+}
+
 /** The rendered preview — extracted from the original ChatMessage body */
 function PreviewContent({
   text,
   hasText,
   hasSpec,
   spec,
+  parts,
   isStreaming,
   activeToolCalls,
 }: {
@@ -147,18 +210,25 @@ function PreviewContent({
   hasText: boolean;
   hasSpec: boolean;
   spec: Spec | null;
+  parts: Part[];
   isStreaming?: boolean;
   activeToolCalls: Part[];
 }) {
+  // Resolve $state references and compute transforms
+  const resolvedSpec = useResolvedSpec(spec, parts);
+
   return (
     <>
       {/* Text content */}
       {hasText && (
-        <div className="rounded-2xl rounded-bl-md bg-zinc-900 border border-zinc-800 px-4 py-2.5 text-sm text-zinc-300 leading-relaxed whitespace-pre-wrap">
-          {text}
-          {isStreaming && !hasSpec && (
-            <span className="inline-block w-1.5 h-4 bg-indigo-500 ml-0.5 animate-pulse rounded-sm" />
-          )}
+        <div className="rounded-2xl rounded-bl-md bg-zinc-900 border border-zinc-800 px-4 py-2.5 text-sm text-zinc-300 leading-relaxed">
+          <Streamdown
+            animated
+            plugins={{ code, math, mermaid, cjk }}
+            isAnimating={!!(isStreaming && !hasSpec)}
+          >
+            {text ?? ""}
+          </Streamdown>
         </div>
       )}
 
@@ -172,12 +242,12 @@ function PreviewContent({
       ))}
 
       {/* Rendered UI spec */}
-      {hasSpec && spec && (
+      {hasSpec && resolvedSpec && (
         <div className="rounded-2xl bg-zinc-900/50 border border-zinc-800 p-4 overflow-hidden">
           <ErrorBoundary>
             <JSONUIProvider registry={registry}>
               <Renderer
-                spec={spec!}
+                spec={resolvedSpec}
                 registry={registry}
                 loading={isStreaming}
                 fallback={({ element }) => (

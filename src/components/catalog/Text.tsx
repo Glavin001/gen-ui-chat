@@ -2,6 +2,10 @@
 
 import type { ComponentRenderProps } from "@json-render/react";
 import { cn } from "@/lib/cn";
+import { Streamdown } from "streamdown";
+import { code } from "@streamdown/code";
+import { math } from "@streamdown/math";
+import { cjk } from "@streamdown/cjk";
 
 interface TextProps {
   content: string;
@@ -20,14 +24,16 @@ export function Text({ element }: ComponentRenderProps<TextProps>) {
   }
 
   return (
-    <p
+    <div
       className={cn(
         variant === "heading" && "text-lg font-semibold text-zinc-100",
         variant === "body" && "text-sm text-zinc-300 leading-relaxed",
         variant === "caption" && "text-xs text-zinc-500"
       )}
     >
-      {content}
-    </p>
+      <Streamdown plugins={{ code, math, cjk }}>
+        {content}
+      </Streamdown>
+    </div>
   );
 }
