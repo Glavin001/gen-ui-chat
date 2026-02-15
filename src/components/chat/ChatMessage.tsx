@@ -347,6 +347,9 @@ function getPartSummary(part: Part): string {
       if (data && typeof data === "object" && "spec" in (data as Record<string, unknown>)) {
         return "json-render spec";
       }
+      if (data && typeof data === "object") {
+        return summarizeDataSpec(data as Record<string, unknown>);
+      }
       return typeof data === "string" ? truncate(data, 80) : "data object";
     }
     case "tool-invocation":
@@ -364,6 +367,76 @@ function getPartSummary(part: Part): string {
     default:
       return truncate(JSON.stringify(part), 100);
   }
+}
+
+/** Produce a concise summary for a data-spec object */
+function summarizeDataSpec(data: Record<string, unknown>): string {
+  // Handle patch operations: { type: "patch", patch: { op, path, value } }
+  if (data.type === "patch" && data.patch && typeof data.patch === "object") {
+    const patch = data.patch as Record<string, unknown>;
+    const op = patch.op as string | undefined;
+    const path = patch.path as string | undefined;
+    const value = patch.value;
+
+    if (op && path) {
+      const valueSummary = summarizePatchValue(value);
+      return valueSummary
+        ? `${op} ${path} → ${valueSummary}`
+        : `${op} ${path}`;
+    }
+  }
+
+  // Handle spec-like objects with a "type" field: { type: "Stack", props: {...}, children: [...] }
+  if (typeof data.type === "string" && data.type !== "patch") {
+    const componentType = data.type;
+    const props = data.props as Record<string, unknown> | undefined;
+    const propHint = props ? summarizeProps(props) : "";
+    return propHint ? `${componentType} ${propHint}` : componentType;
+  }
+
+  // Fallback: show top-level keys
+  const keys = Object.keys(data);
+  if (keys.length <= 4) {
+    return `{ ${keys.join(", ")} }`;
+  }
+  return `{ ${keys.slice(0, 3).join(", ")}, +${keys.length - 3} }`;
+}
+
+/** Summarize the value side of a patch operation */
+function summarizePatchValue(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return `"${truncate(value, 30)}"`;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return `[${value.length} items]`;
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    // If it's a component-like object with a type, show that
+    if (typeof obj.type === "string") {
+      const children = obj.children;
+      const childHint = Array.isArray(children)
+        ? ` (${children.length} children)`
+        : "";
+      return obj.type + childHint;
+    }
+    const keys = Object.keys(obj);
+    if (keys.length <= 3) return `{ ${keys.join(", ")} }`;
+    return `{ ${keys.slice(0, 2).join(", ")}, +${keys.length - 2} }`;
+  }
+  return "";
+}
+
+/** Summarize props into a short hint like "columns=3 gap=medium" */
+function summarizeProps(props: Record<string, unknown>): string {
+  const entries = Object.entries(props);
+  if (entries.length === 0) return "";
+  const parts = entries.slice(0, 3).map(([k, v]) => {
+    if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+      return `${k}=${v}`;
+    }
+    return k;
+  });
+  const suffix = entries.length > 3 ? " …" : "";
+  return `(${parts.join(", ")}${suffix})`;
 }
 
 /** Full expanded content for a part */

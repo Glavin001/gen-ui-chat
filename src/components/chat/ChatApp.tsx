@@ -42,7 +42,7 @@ export function ChatApp() {
 
       {/* Messages */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-3xl px-4 py-6 space-y-4">
+        <div className={`mx-auto px-4 py-6 space-y-4 ${viewMode === "split" ? "w-full" : "max-w-3xl"}`}>
           {messages.length === 0 && (
             <WelcomeScreen onSuggestion={handleSend} />
           )}
