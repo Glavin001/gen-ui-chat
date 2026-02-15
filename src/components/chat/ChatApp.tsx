@@ -5,7 +5,7 @@ import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { ChatMessage } from "./ChatMessage";
 import { ChatInput } from "./ChatInput";
 import { ViewModeToggle, type ViewMode } from "./ViewModeToggle";
-import { extractToolResults, type ToolInvocationPart } from "@/lib/state-resolver";
+import { extractToolResults, extractSetStateResults, type ToolInvocationPart } from "@/lib/state-resolver";
 
 export function ChatApp() {
   // AI SDK v6: useChat defaults to DefaultChatTransport with api="/api/chat"
@@ -35,23 +35,35 @@ export function ChatApp() {
     [regenerate]
   );
 
-  // Compute accumulated tool results for each message index.
-  // Each message sees tool results from ALL prior messages (not just its own).
-  // This allows fix attempts and multi-turn flows to reference earlier tool data.
-  const accumulatedToolResultsByIndex = useMemo(() => {
-    const result: Record<number, Record<string, unknown>> = {};
-    let accumulated: Record<string, unknown> = {};
+  // Compute accumulated tool results and set_state results for each message index.
+  // Each message sees data from ALL prior messages (not just its own).
+  // This allows fix attempts and multi-turn flows to reference earlier data.
+  const accumulatedDataByIndex = useMemo(() => {
+    const result: Record<number, { toolResults: Record<string, { input: unknown; output: unknown }>; setStateResults: { rawState: Record<string, unknown>; computedDefs: Record<string, { deps: string[]; fn: string }> } }> = {};
+    let accToolResults: Record<string, { input: unknown; output: unknown }> = {};
+    let accRawState: Record<string, unknown> = {};
+    let accComputedDefs: Record<string, { deps: string[]; fn: string }> = {};
 
     for (let i = 0; i < messages.length; i++) {
-      // This message sees all tool results accumulated before it
-      result[i] = { ...accumulated };
+      // This message sees all data accumulated before it
+      result[i] = {
+        toolResults: { ...accToolResults },
+        setStateResults: { rawState: { ...accRawState }, computedDefs: { ...accComputedDefs } },
+      };
 
-      // Extract tool results from this message and add to the running total
+      // Extract tool results and set_state results from this message
       const parts = messages[i].parts;
       if (parts && parts.length > 0) {
         const toolResults = extractToolResults(parts as ToolInvocationPart[]);
         if (Object.keys(toolResults).length > 0) {
-          accumulated = { ...accumulated, ...toolResults };
+          accToolResults = { ...accToolResults, ...toolResults };
+        }
+        const setStateResults = extractSetStateResults(parts as ToolInvocationPart[]);
+        if (Object.keys(setStateResults.rawState).length > 0) {
+          accRawState = { ...accRawState, ...setStateResults.rawState };
+        }
+        if (Object.keys(setStateResults.computedDefs).length > 0) {
+          accComputedDefs = { ...accComputedDefs, ...setStateResults.computedDefs };
         }
       }
     }
@@ -106,9 +118,12 @@ export function ChatApp() {
             const isLastAssistant =
               msg.role === "assistant" && idx === messages.length - 1;
 
-            // Accumulate tool results from ALL prior messages so that
+            // Accumulate data from ALL prior messages so that
             // fix attempts and multi-turn flows can reference earlier data
-            const priorToolResults = accumulatedToolResultsByIndex[idx] ?? {};
+            const priorData = accumulatedDataByIndex[idx] ?? {
+              toolResults: {},
+              setStateResults: { rawState: {}, computedDefs: {} },
+            };
 
             return (
               <ChatMessage
@@ -116,7 +131,8 @@ export function ChatApp() {
                 id={msg.id}
                 role={msg.role as "user" | "assistant"}
                 parts={msg.parts}
-                accumulatedToolResults={priorToolResults}
+                accumulatedToolResults={priorData.toolResults}
+                accumulatedSetStateResults={priorData.setStateResults}
                 isStreaming={isLastAssistant && isStreaming}
                 viewMode={viewMode}
                 onRequestFix={handleSend}

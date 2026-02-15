@@ -3,10 +3,12 @@
  * to json-render component props via $state bindings.
  *
  * Flow:
- *   1. extractToolResults(parts) → tool data at /tools/{toolName}
- *   2. extractTransformDefs(specState) → transform definitions from spec state
- *   3. computeTransforms(defs, stateModel, sandbox) → { outputs, errors }
- *   4. resolveSpecState(spec, stateModel) → spec with $state refs replaced by values
+ *   1. extractToolResults(parts) → tool data at /tools/{toolCallId}/{input,output}
+ *   2. extractSetStateResults(parts) → raw state + computed defs from set_state tool
+ *   3. extractTransformDefs(computedDefs, specState?) → merged transform definitions
+ *   4. computeTransforms(defs, stateModel, sandbox) → { outputs, errors }
+ *   5. buildStateModel(rawState, toolResults, computedOutputs, specState?) → full model
+ *   6. resolveSpecState(spec, stateModel) → spec with $state refs replaced by values
  */
 
 import { getByPath, type Spec } from "@json-render/core";
@@ -66,51 +68,79 @@ export interface ToolInvocationPart {
 }
 
 /**
+ * Parse MCP tool output which may be:
+ *   - Already parsed object/array (pass through)
+ *   - JSON string (parse it)
+ *   - MCP content array: [{ type: "text", text: "..." }] (extract and parse text)
+ */
+function parseMcpOutput(data: unknown): unknown {
+  if (typeof data === "string") {
+    try { return JSON.parse(data); } catch { return data; }
+  }
+  if (Array.isArray(data) && data.length > 0) {
+    const first = data[0] as Record<string, unknown> | undefined;
+    if (first && first.type === "text" && typeof first.text === "string") {
+      try { return JSON.parse(first.text); } catch { return first.text; }
+    }
+  }
+  return data;
+}
+
+/**
  * Extract completed tool results from message parts.
- * Returns a map of toolName → result data.
+ * Returns a map of toolCallId → { input, output } for each completed tool call.
  *
- * Handles two AI SDK part formats:
+ * Keyed ONLY by toolCallId (no toolName alias). This makes the tools namespace
+ * fully immutable: once a tool call completes, its entry never changes.
+ *
+ * Handles three AI SDK part formats:
  *   1. Legacy: { type: "tool-invocation", toolInvocation: { toolName, state, result, ... } }
- *   2. AI SDK v6: { type: "tool-{toolName}", state: "output-available", output: [...] }
- *
- * Tool results are stored by name (latest wins if a tool is called multiple times).
- * Also stored by toolCallId for specific references.
+ *   2. AI SDK v6 static: { type: "tool-{toolName}", state: "output-available", output: [...] }
+ *   3. AI SDK v6 dynamic (MCP/provider-executed): { type: "dynamic-tool", toolName, toolCallId, state, input, output }
  */
 export function extractToolResults(
   parts: ToolInvocationPart[]
-): Record<string, unknown> {
-  const tools: Record<string, unknown> = {};
+): Record<string, { input: unknown; output: unknown }> {
+  const tools: Record<string, { input: unknown; output: unknown }> = {};
 
   for (const part of parts) {
-    // Format 1: AI SDK v6 — type is "tool-{toolName}", data at top level
+    // Format 1: AI SDK v6 static — type is "tool-{toolName}", data at top level
     if (part.type.startsWith("tool-") && part.type !== "tool-invocation" && part.type !== "tool-call" && part.type !== "tool-result") {
       const state = part.state ?? part.toolInvocation?.state;
       if (state === "output-available" || state === "result") {
-        const toolName = part.type.replace(/^tool-/, "");
         const data = part.output ?? part.result ?? part.toolInvocation?.result ?? part.toolInvocation?.output;
-        if (data !== undefined) {
-          tools[toolName] = data;
-          const callId = part.toolCallId ?? part.toolInvocation?.toolCallId;
-          if (callId) {
-            tools[callId] = data;
-          }
+        const callId = part.toolCallId ?? part.toolInvocation?.toolCallId;
+        if (callId && data !== undefined) {
+          const input = part.input ?? part.toolInvocation?.args ?? null;
+          tools[callId] = { input, output: data };
         }
       }
     }
 
-    // Format 2: Legacy — type is "tool-invocation", data in toolInvocation
+    // Format 2: AI SDK v6 dynamic — type is "dynamic-tool" (MCP / provider-executed tools)
+    if (part.type === "dynamic-tool") {
+      const state = part.state;
+      if (state === "output-available" || state === "result") {
+        let data = part.output ?? part.result;
+        const callId = part.toolCallId;
+        if (callId && data !== undefined) {
+          // MCP tools may return string (JSON-serialized) or content array
+          data = parseMcpOutput(data);
+          tools[callId] = { input: part.input ?? null, output: data };
+        }
+      }
+    }
+
+    // Format 3: Legacy — type is "tool-invocation", data in toolInvocation
     if (
       (part.type === "tool-invocation" || part.type === "tool-call") &&
       part.toolInvocation
     ) {
-      const { state, toolName, toolCallId, result, output } = part.toolInvocation;
+      const { state, toolCallId, result, output, args } = part.toolInvocation;
       if (state === "result" || state === "output-available") {
         const data = result ?? output;
-        if (data !== undefined) {
-          tools[toolName] = data;
-          if (toolCallId) {
-            tools[toolCallId] = data;
-          }
+        if (toolCallId && data !== undefined) {
+          tools[toolCallId] = { input: args ?? null, output: data };
         }
       }
     }
@@ -119,25 +149,133 @@ export function extractToolResults(
   return tools;
 }
 
+// ─── set_state Tool Result Extraction ────────────────────────────────
+
+/** Result of extracting set_state tool calls from message parts. */
+export interface SetStateExtraction {
+  /** Merged raw state values from all set_state calls. Later calls override earlier ones. */
+  rawState: Record<string, unknown>;
+  /** Merged computed transform definitions from all set_state calls. */
+  computedDefs: Record<string, TransformDef>;
+}
+
+/**
+ * Check if a tool name refers to the set_state tool.
+ * Handles both direct name ("set_state") and MCP-prefixed names
+ * (e.g. "mcp__app-tools__set_state").
+ */
+function isSetStateTool(name: string | undefined): boolean {
+  if (!name) return false;
+  return name === "set_state" || name.endsWith("__set_state");
+}
+
+/**
+ * Extract state values and computed transform definitions from set_state tool results.
+ * Looks for completed tool calls where toolName matches set_state (including MCP prefix)
+ * and extracts the `_state` and `_computed` fields echoed back from the server.
+ *
+ * Multiple set_state calls are merged — later calls override earlier ones for the same key.
+ */
+export function extractSetStateResults(
+  parts: ToolInvocationPart[]
+): SetStateExtraction {
+  const rawState: Record<string, unknown> = {};
+  const computedDefs: Record<string, TransformDef> = {};
+
+  for (const part of parts) {
+    let matched = false;
+    let state: string | undefined;
+    let data: unknown;
+
+    // Format 1: AI SDK v6 static — type is "tool-set_state"
+    if (part.type === "tool-set_state") {
+      state = part.state ?? part.toolInvocation?.state;
+      data = part.output ?? part.result ?? part.toolInvocation?.result ?? part.toolInvocation?.output;
+      matched = true;
+    }
+
+    // Format 2: AI SDK v6 dynamic — type is "dynamic-tool" with set_state toolName
+    if (part.type === "dynamic-tool" && isSetStateTool(part.toolName as string | undefined)) {
+      state = part.state;
+      data = part.output ?? part.result;
+      matched = true;
+    }
+
+    // Format 3: Legacy — type is "tool-invocation" / "tool-call"
+    if (
+      (part.type === "tool-invocation" || part.type === "tool-call") &&
+      isSetStateTool(part.toolInvocation?.toolName)
+    ) {
+      state = part.toolInvocation!.state;
+      data = part.toolInvocation!.result ?? part.toolInvocation!.output;
+      matched = true;
+    }
+
+    if (!matched) continue;
+    if (state !== "result" && state !== "output-available") continue;
+    if (!data) continue;
+
+    // Parse MCP output (may be string, content array, or already-parsed object)
+    data = parseMcpOutput(data);
+    if (typeof data !== "object" || data === null || Array.isArray(data)) continue;
+
+    const result = data as Record<string, unknown>;
+
+    // Only process successful set_state results
+    if (result.ok !== true) continue;
+
+    // Extract echoed raw state values
+    if (result._state && typeof result._state === "object") {
+      Object.assign(rawState, result._state);
+    }
+
+    // Extract echoed computed definitions
+    if (result._computed && typeof result._computed === "object") {
+      for (const [key, def] of Object.entries(
+        result._computed as Record<string, unknown>
+      )) {
+        if (isTransformDef(def)) {
+          computedDefs[key] = def;
+        }
+      }
+    }
+  }
+
+  return { rawState, computedDefs };
+}
+
 // ─── Transform Extraction & Computation ──────────────────────────────
 
 /**
- * Extract transform definitions from the spec's state tree.
- * Transforms are at state.tx.{key} and have { deps: string[], fn: string }.
+ * Extract transform definitions from computed defs (set_state tool results)
+ * and/or the spec's legacy state tree (state.tx.{key}).
+ *
+ * Priority: set_state computed defs override spec-based tx defs for the same key.
+ *
+ * @param computedDefs - Computed definitions extracted from set_state tool results
+ * @param specState - Legacy spec state (for backward compat with state.tx.{key})
  */
 export function extractTransformDefs(
-  specState: Record<string, unknown> | undefined
+  computedDefs: Record<string, TransformDef>,
+  specState?: Record<string, unknown> | undefined
 ): Record<string, TransformDef> {
   const defs: Record<string, TransformDef> = {};
-  if (!specState) return defs;
 
-  const tx = specState.tx as Record<string, unknown> | undefined;
-  if (!tx || typeof tx !== "object") return defs;
-
-  for (const [key, value] of Object.entries(tx)) {
-    if (isTransformDef(value)) {
-      defs[key] = value;
+  // Legacy: read from specState.tx (backward compat)
+  if (specState) {
+    const tx = specState.tx as Record<string, unknown> | undefined;
+    if (tx && typeof tx === "object") {
+      for (const [key, value] of Object.entries(tx)) {
+        if (isTransformDef(value)) {
+          defs[key] = value;
+        }
+      }
     }
+  }
+
+  // set_state computed defs override legacy tx defs
+  for (const [key, def] of Object.entries(computedDefs)) {
+    defs[key] = def;
   }
 
   return defs;
@@ -206,34 +344,40 @@ export function computeTransforms(
 // ─── State Model Assembly ────────────────────────────────────────────
 
 /**
- * Build the combined state model from tool results, spec state, and transform outputs.
+ * Build the combined state model from raw state (set via set_state tool),
+ * tool results, and computed transform outputs.
  *
  * Aligned with json-render convention: $state paths resolve relative to the
- * state object, so spec state is spread at the root level.
+ * state object, so raw state is spread at the root level.
  *
  * State model layout (JSON Pointer paths):
- *   /{key}              → spec state data (e.g. /weather/hourly) — json-render convention
- *   /state/{key}        → same spec state (backward compat alias)
- *   /tools/{toolName}   → tool result data
- *   /tools/{callId}     → tool result data (by call ID)
- *   /tx/{key}           → transform output value (overrides raw defs from spec state)
+ *   /{key}                        → raw state (set via set_state tool)
+ *   /state/{key}                  → same raw state (backward compat alias)
+ *   /computed/{key}               → computed transform output
+ *   /tools/{toolCallId}/input     → tool call arguments (immutable)
+ *   /tools/{toolCallId}/output    → tool call result data (immutable)
  *
- * Reserved keys: `state`, `tools`, `tx` — spec state keys with these names are shadowed.
+ * Also supports legacy spec state spread at root for backward compat.
+ *
+ * Reserved keys: `state`, `tools`, `computed` — cannot be used as raw state keys.
  */
 export function buildStateModel(
-  toolResults: Record<string, unknown>,
-  specState: Record<string, unknown> | undefined,
-  txOutputs: Record<string, unknown>
+  rawState: Record<string, unknown>,
+  toolResults: Record<string, { input: unknown; output: unknown }>,
+  computedOutputs: Record<string, unknown>,
+  specState?: Record<string, unknown> | undefined
 ): Record<string, unknown> {
   return {
-    // Spec state spread at root: /weather/hourly works (json-render convention)
+    // Legacy spec state spread at root (backward compat)
     ...(specState ?? {}),
+    // Raw state from set_state tool spread at root: /weather/hourly works
+    ...rawState,
     // Backward compat: /state/weather/hourly also works
-    state: specState ?? {},
-    // Tool results at /tools/{id}
+    state: { ...(specState ?? {}), ...rawState },
+    // Computed transform outputs at /computed/{key}
+    computed: computedOutputs,
+    // Tool results at /tools/{toolCallId}/input and /tools/{toolCallId}/output
     tools: toolResults,
-    // Transform outputs at /tx/{key} — overrides raw tx definitions from specState
-    tx: txOutputs,
   };
 }
 

@@ -11,8 +11,8 @@ import { anthropic } from "@ai-sdk/anthropic";
 import { openai } from "@ai-sdk/openai";
 import { pipeJsonRender } from "@json-render/core";
 import { generateSystemPrompt } from "@/lib/system-prompt";
-import { tools } from "@/lib/tools";
-import { claudeCode } from 'ai-sdk-provider-claude-code';
+import { tools, toolDefs } from "@/lib/tools";
+import { claudeCode, createCustomMcpServer } from 'ai-sdk-provider-claude-code';
 
 export const maxDuration = 60;
 
@@ -85,15 +85,79 @@ function injectToolCallIdsIntoMessages(
   });
 }
 
-// ─── Model Selection ─────────────────────────────────────────────────
+// ─── MCP Server for Claude Code ──────────────────────────────────────
 
 /**
- * Select the AI model based on available API keys.
+ * Create an MCP server that exposes our app tools to Claude Code.
+ * Claude Code doesn't use AI SDK's `tools` parameter — tools must be
+ * provided via MCP servers.
+ *
+ * Each handler wraps our existing execute functions and returns
+ * the MCP-required { content: [{ type: 'text', text }] } format.
+ */
+function createAppToolsMcpServer() {
+  return createCustomMcpServer({
+    name: "app-tools",
+    tools: {
+      get_weather: {
+        description: toolDefs.get_weather.description,
+        inputSchema: toolDefs.get_weather.inputSchema,
+        handler: async (args) => {
+          const result = await toolDefs.get_weather.execute(args as { city: string; unit: "celsius" | "fahrenheit" });
+          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        },
+      },
+      search_stocks: {
+        description: toolDefs.search_stocks.description,
+        inputSchema: toolDefs.search_stocks.inputSchema,
+        handler: async (args) => {
+          const result = await toolDefs.search_stocks.execute(args as { symbols: string[] });
+          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        },
+      },
+      get_statistics: {
+        description: toolDefs.get_statistics.description,
+        inputSchema: toolDefs.get_statistics.inputSchema,
+        handler: async (args) => {
+          const result = await toolDefs.get_statistics.execute(args as { topic: string; dataPoints: number });
+          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        },
+      },
+      set_state: {
+        description: toolDefs.set_state.description,
+        inputSchema: toolDefs.set_state.inputSchema,
+        handler: async (args) => {
+          const result = await toolDefs.set_state.execute(args as {
+            state?: Record<string, unknown>;
+            computed?: Record<string, { deps: string[]; fn: string }>;
+          });
+          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        },
+      },
+    },
+  });
+}
+
+// Tool names as they appear to Claude Code via MCP: mcp__<serverName>__<toolName>
+const APP_MCP_TOOL_NAMES = [
+  "mcp__app-tools__get_weather",
+  "mcp__app-tools__search_stocks",
+  "mcp__app-tools__get_statistics",
+  "mcp__app-tools__set_state",
+];
+
+// ─── Model Selection ─────────────────────────────────────────────────
+
+/** Whether to use Claude Code provider (vs direct Anthropic/OpenAI API) */
+const USE_CLAUDE_CODE = true;
+
+/**
+ * Select the AI model based on configuration and available API keys.
  */
 function getModel() {
-  return claudeCode('haiku', {
-    allowedTools: ['WebSearch', 'WebFetch', 'Read', 'LS'],
-  });
+  if (USE_CLAUDE_CODE) {
+    return createClaudeCodeModel();
+  }
 
   if (
     process.env.ANTHROPIC_API_KEY &&
@@ -102,6 +166,26 @@ function getModel() {
     return anthropic(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-20250514");
   }
   return openai(process.env.OPENAI_MODEL ?? "gpt-4o");
+}
+
+function createClaudeCodeModel() {
+  const appToolsServer = createAppToolsMcpServer();
+
+  return claudeCode('haiku', {
+    mcpServers: {
+      "app-tools": appToolsServer,
+    },
+    // Allow our MCP tools + built-in Claude Code tools for web access
+    allowedTools: [
+      ...APP_MCP_TOOL_NAMES,
+      'WebSearch',
+      'WebFetch',
+      'Read',
+      'LS',
+    ],
+    disallowedTools: ['Write', 'Edit', 'Bash', 'Task', 'Glob', 'Grep'],
+    debug: true,
+  });
 }
 
 // ─── Route Handler ───────────────────────────────────────────────────
@@ -119,8 +203,9 @@ export async function POST(req: Request) {
     model,
     system: systemPrompt,
     messages: modelMessages,
-    tools,
-    toolChoice: "auto",
+    // AI SDK tools are only used by non-Claude-Code models.
+    // Claude Code receives tools via MCP server (see createAppToolsMcpServer).
+    ...(USE_CLAUDE_CODE ? {} : { tools, toolChoice: "auto" as const }),
     stopWhen: stepCountIs(5),
 
     /**
@@ -151,7 +236,7 @@ export async function POST(req: Request) {
         const mapping = toolCallMap
           .map(
             (c) =>
-              `- Tool "${c.toolName}" → toolCallId: "${c.toolCallId}" → use $state path: /tools/${c.toolCallId}`
+              `- Tool "${c.toolName}" → toolCallId: "${c.toolCallId}" → output at: /tools/${c.toolCallId}/output → input at: /tools/${c.toolCallId}/input`
           )
           .join("\n");
         enhancedSystem =

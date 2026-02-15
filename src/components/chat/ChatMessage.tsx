@@ -15,6 +15,7 @@ import { cn } from "@/lib/cn";
 import type { ViewMode } from "./ViewModeToggle";
 import {
   extractToolResults,
+  extractSetStateResults,
   extractTransformDefs,
   computeTransforms,
   buildStateModel,
@@ -44,12 +45,20 @@ interface Part {
   [key: string]: unknown;
 }
 
+/** Accumulated set_state results from prior messages. */
+export interface AccumulatedSetStateResults {
+  rawState: Record<string, unknown>;
+  computedDefs: Record<string, { deps: string[]; fn: string }>;
+}
+
 export interface ChatMessageProps {
   id: string;
   role: "user" | "assistant";
   parts: Part[];
-  /** Accumulated tool results from all prior messages in the conversation */
-  accumulatedToolResults?: Record<string, unknown>;
+  /** Accumulated tool results from all prior messages (keyed by toolCallId) */
+  accumulatedToolResults?: Record<string, { input: unknown; output: unknown }>;
+  /** Accumulated set_state results from all prior messages */
+  accumulatedSetStateResults?: AccumulatedSetStateResults;
   isStreaming?: boolean;
   viewMode?: ViewMode;
   /** Callback to send a follow-up message to the AI agent (e.g. error fix request) */
@@ -65,6 +74,7 @@ export function ChatMessage({
   role,
   parts,
   accumulatedToolResults,
+  accumulatedSetStateResults,
   isStreaming,
   viewMode = "preview",
   onRequestFix,
@@ -80,11 +90,15 @@ export function ChatMessage({
   const { spec, hasSpec } = jsonRenderResult;
   const text = jsonRenderResult.text || textContent;
 
-  // Extract tool invocation state from parts
+  // Extract tool invocation state from parts (including dynamic/MCP tools)
   const activeToolCalls = parts.filter(
     (p) =>
-      (p.type === "tool-invocation" || p.type === "tool-call") &&
-      (p.toolInvocation?.state === "call" || p.toolInvocation?.state === "partial-call")
+      // Legacy tool-invocation / tool-call
+      ((p.type === "tool-invocation" || p.type === "tool-call") &&
+        (p.toolInvocation?.state === "call" || p.toolInvocation?.state === "partial-call")) ||
+      // Dynamic tools (MCP / provider-executed) — in-progress states
+      (p.type === "dynamic-tool" &&
+        (p.state === "input-streaming" || p.state === "input-available"))
   );
 
   // For user messages, extract text from parts
@@ -126,7 +140,7 @@ export function ChatMessage({
       >
         {showState ? (
           /* ─── State Debug View ─── */
-          <StateView spec={spec} parts={parts} accumulatedToolResults={accumulatedToolResults} />
+          <StateView spec={spec} parts={parts} accumulatedToolResults={accumulatedToolResults} accumulatedSetStateResults={accumulatedSetStateResults} />
         ) : viewMode === "split" ? (
           /* ─── Split View ─── */
           <div className="grid grid-cols-2 gap-3">
@@ -139,6 +153,7 @@ export function ChatMessage({
                 spec={spec}
                 parts={parts}
                 accumulatedToolResults={accumulatedToolResults}
+                accumulatedSetStateResults={accumulatedSetStateResults}
                 isStreaming={isStreaming}
                 activeToolCalls={activeToolCalls}
                 onRequestFix={onRequestFix}
@@ -161,6 +176,7 @@ export function ChatMessage({
             spec={spec}
             parts={parts}
             accumulatedToolResults={accumulatedToolResults}
+            accumulatedSetStateResults={accumulatedSetStateResults}
             isStreaming={isStreaming}
             activeToolCalls={activeToolCalls}
             onRequestFix={onRequestFix}
@@ -305,7 +321,8 @@ interface ExtendedResolutionResult extends ResolutionResult {
 function useResolvedSpec(
   spec: Spec | null,
   parts: Part[],
-  accumulatedToolResults?: Record<string, unknown>
+  accumulatedToolResults?: Record<string, { input: unknown; output: unknown }>,
+  accumulatedSetStateResults?: AccumulatedSetStateResults
 ): ExtendedResolutionResult {
   // Derive a stable fingerprint — same string = same tool results, skip recompute.
   // This avoids re-running the expensive pipeline when the parent re-renders
@@ -328,38 +345,49 @@ function useResolvedSpec(
     try {
       const allErrors: StateError[] = [];
 
-      // 1. Extract tool results from message parts, merged with accumulated results
+      // 1. Extract tool results from message parts (keyed by toolCallId with input/output)
       const currentToolResults = extractToolResults(parts as ToolInvocationPart[]);
       const toolResults = { ...(accumulatedToolResults ?? {}), ...currentToolResults };
 
-      // 2. Extract transform definitions from spec's state tree
+      // 2. Extract set_state results from message parts (raw state + computed defs)
+      const currentSetState = extractSetStateResults(parts as ToolInvocationPart[]);
+      const rawState = {
+        ...(accumulatedSetStateResults?.rawState ?? {}),
+        ...currentSetState.rawState,
+      };
+      const accComputedDefs = {
+        ...(accumulatedSetStateResults?.computedDefs ?? {}),
+        ...currentSetState.computedDefs,
+      };
+
+      // 3. Extract transform definitions (from set_state computed + legacy spec state.tx)
       const specState = (stableSpec as unknown as Record<string, unknown>).state as
         | Record<string, unknown>
         | undefined;
-      const txDefs = extractTransformDefs(specState);
+      const txDefs = extractTransformDefs(accComputedDefs, specState);
 
-      // Build initial state model (without transform outputs yet)
-      const baseState = buildStateModel(toolResults, specState, {});
+      // Build initial state model (without computed outputs yet)
+      const baseState = buildStateModel(rawState, toolResults, {}, specState);
 
-      // 3. Compute transforms (may reference tool data via deps)
-      const { outputs: txOutputs, errors: txErrors } = computeTransforms(
+      // 4. Compute transforms (may reference tool data via deps)
+      const { outputs: computedOutputs, errors: txErrors } = computeTransforms(
         txDefs,
         baseState,
         sandbox
       );
       allErrors.push(...txErrors);
 
-      // 4. Build final state model with transform outputs
-      const stateModel = buildStateModel(toolResults, specState, txOutputs);
+      // 5. Build final state model with computed outputs
+      const stateModel = buildStateModel(rawState, toolResults, computedOutputs, specState);
 
-      // 5. Resolve all $state references in the spec
+      // 6. Resolve all $state references in the spec
       const { spec: resolvedSpec, errors: refErrors } = resolveSpecState(
         stableSpec,
         stateModel
       );
       allErrors.push(...refErrors);
 
-      // 6. Validate resolved prop types (e.g. data must be array for charts)
+      // 7. Validate resolved prop types (e.g. data must be array for charts)
       const propTypeErrors = validateResolvedProps(resolvedSpec);
       allErrors.push(...propTypeErrors);
 
@@ -380,7 +408,7 @@ function useResolvedSpec(
       };
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps -- stableSpec+partsFingerprint are stable proxies
-  }, [stableSpec, partsFingerprint, accumulatedToolResults]);
+  }, [stableSpec, partsFingerprint, accumulatedToolResults, accumulatedSetStateResults]);
 }
 
 /** The rendered preview — extracted from the original ChatMessage body */
@@ -391,6 +419,7 @@ function PreviewContent({
   spec,
   parts,
   accumulatedToolResults,
+  accumulatedSetStateResults,
   isStreaming,
   activeToolCalls,
   onRequestFix,
@@ -400,13 +429,14 @@ function PreviewContent({
   hasSpec: boolean;
   spec: Spec | null;
   parts: Part[];
-  accumulatedToolResults?: Record<string, unknown>;
+  accumulatedToolResults?: Record<string, { input: unknown; output: unknown }>;
+  accumulatedSetStateResults?: AccumulatedSetStateResults;
   isStreaming?: boolean;
   activeToolCalls: Part[];
   onRequestFix?: (text: string) => void;
 }) {
   // Resolve $state references and compute transforms
-  const { spec: resolvedSpec, errors } = useResolvedSpec(spec, parts, accumulatedToolResults);
+  const { spec: resolvedSpec, errors } = useResolvedSpec(spec, parts, accumulatedToolResults, accumulatedSetStateResults);
 
   // Only show errors when not streaming (errors during streaming are transient)
   const visibleErrors = !isStreaming ? errors : [];
@@ -471,8 +501,8 @@ function PreviewContent({
       {activeToolCalls.map((part, i) => (
         <ToolCallIndicator
           key={i}
-          toolName={part.toolInvocation?.toolName ?? "unknown"}
-          args={part.toolInvocation?.args}
+          toolName={(part.type === "dynamic-tool" ? (part.toolName as string) : part.toolInvocation?.toolName) ?? "unknown"}
+          args={part.type === "dynamic-tool" ? (part.input as Record<string, unknown>) : part.toolInvocation?.args}
         />
       ))}
 
@@ -712,8 +742,8 @@ function RawPart({
 }
 
 /** Wrapper that hooks into useResolvedSpec and renders StateContent */
-function StateView({ spec, parts, accumulatedToolResults }: { spec: Spec | null; parts: Part[]; accumulatedToolResults?: Record<string, unknown> }) {
-  const { errors, stateModel } = useResolvedSpec(spec, parts, accumulatedToolResults);
+function StateView({ spec, parts, accumulatedToolResults, accumulatedSetStateResults }: { spec: Spec | null; parts: Part[]; accumulatedToolResults?: Record<string, { input: unknown; output: unknown }>; accumulatedSetStateResults?: AccumulatedSetStateResults }) {
+  const { errors, stateModel } = useResolvedSpec(spec, parts, accumulatedToolResults, accumulatedSetStateResults);
 
   return (
     <StateContent
@@ -789,9 +819,9 @@ function StateContent({
       {/* State tree */}
       {stateModel ? (
         <div className="divide-y divide-zinc-800/30">
-          {/* Spec state keys (everything except reserved keys) */}
+          {/* Raw state keys (everything except reserved keys) */}
           {Object.entries(stateModel as Record<string, unknown>)
-            .filter(([key]) => key !== "state" && key !== "tools" && key !== "tx")
+            .filter(([key]) => key !== "state" && key !== "tools" && key !== "computed")
             .map(([key]) => (
               <StateTreeSection
                 key={key}
@@ -803,14 +833,22 @@ function StateContent({
                 badgeColor="bg-purple-500/15 text-purple-400"
               />
             ))}
-          {/* Show empty hint if no spec state keys exist */}
+          {/* Show empty hint if no raw state keys exist */}
           {Object.keys(stateModel as Record<string, unknown>)
-            .filter((key) => key !== "state" && key !== "tools" && key !== "tx")
+            .filter((key) => key !== "state" && key !== "tools" && key !== "computed")
             .length === 0 && (
             <div className="px-3 py-1.5 text-[10px] text-zinc-600 italic">
-              No spec state data
+              No raw state data (use set_state tool to add)
             </div>
           )}
+          <StateTreeSection
+            title="/computed"
+            path="/computed"
+            data={(stateModel as Record<string, unknown>).computed}
+            filter={filter}
+            defaultExpanded
+            badgeColor="bg-amber-500/15 text-amber-400"
+          />
           <StateTreeSection
             title="/tools"
             path="/tools"
@@ -818,14 +856,6 @@ function StateContent({
             filter={filter}
             defaultExpanded
             badgeColor="bg-emerald-500/15 text-emerald-400"
-          />
-          <StateTreeSection
-            title="/tx"
-            path="/tx"
-            data={(stateModel as Record<string, unknown>).tx}
-            filter={filter}
-            defaultExpanded
-            badgeColor="bg-amber-500/15 text-amber-400"
           />
         </div>
       ) : hasToolResults ? (
