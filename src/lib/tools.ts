@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { tool } from "ai";
+import { webSearch } from "@exalabs/ai-sdk";
 
 /**
  * Available tools for the AI agent.
@@ -123,20 +124,5 @@ export const tools = {
     },
   }),
 
-  web_search: tool({
-    description:
-      "Search the web for information. Returns simulated search results.",
-    inputSchema: z.object({
-      query: z.string().describe("Search query"),
-      maxResults: z.number().optional().default(5).describe("Maximum results"),
-    }),
-    execute: async ({ query, maxResults }) => {
-      const results = Array.from({ length: maxResults }, (_, i) => ({
-        title: `${query} - Result ${i + 1}`,
-        url: `https://example.com/result-${i + 1}`,
-        snippet: `This is a relevant excerpt about "${query}". It contains useful information that answers the query with specific details and data points.`,
-      }));
-      return { query, totalResults: results.length, results };
-    },
-  }),
+  web_search: webSearch(),
 };

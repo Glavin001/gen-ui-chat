@@ -152,13 +152,12 @@ export class ReactiveStore {
 
     const outputSignal = computed(() => {
       // Read all deps (this creates Preact signal subscriptions)
-      const depValues: Record<string, unknown> = {};
+      const args: unknown[] = [];
       for (let i = 0; i < def.deps.length; i++) {
-        depValues[def.deps[i]] = depSignals[i].value;
+        args.push(depSignals[i].value);
       }
-      // The actual sandbox evaluation happens synchronously here
-      // In a real implementation, we'd want async + caching
-      return sandbox.evaluateSync(fn, depValues);
+      // Execute transform: arguments[0] = first dep, arguments[1] = second, etc.
+      return sandbox.evaluateSync(fn, args);
     });
 
     this.nodes.set(`/tx/${key}/$output`, outputSignal);
@@ -221,37 +220,45 @@ export class ReactiveStore {
 
 /**
  * Interface for the transform sandbox.
+ *
+ * Transforms receive resolved dependency values as positional arguments.
+ * Inside the function body, use `arguments[0]`, `arguments[1]`, etc.
  */
 export interface TransformSandbox {
-  evaluateSync(fn: string, deps: Record<string, unknown>): unknown;
-  evaluate(fn: string, deps: Record<string, unknown>): Promise<unknown>;
+  evaluateSync(fn: string, args: unknown[]): unknown;
+  evaluate(fn: string, args: unknown[]): Promise<unknown>;
   dispose(): void;
 }
 
 /**
  * Simple in-process sandbox using Function constructor.
  * For production, use a Web Worker or SES-based sandbox.
+ *
+ * The function body is executed with dependency values as positional arguments:
+ *   arguments[0] = first dep, arguments[1] = second dep, etc.
+ *
+ * Example fn: "const data = arguments[0]; return data.map(s => s.price);"
  */
 export class InProcessSandbox implements TransformSandbox {
   private cache = new Map<string, Function>();
 
-  evaluateSync(fn: string, deps: Record<string, unknown>): unknown {
+  evaluateSync(fn: string, args: unknown[]): unknown {
     try {
       let compiled = this.cache.get(fn);
       if (!compiled) {
-        // The function body receives `deps` as its argument
-        compiled = new Function("deps", fn);
+        // Create a function with no named params — uses arguments[0..n]
+        compiled = new Function(`"use strict"; ${fn}`);
         this.cache.set(fn, compiled);
       }
-      return compiled(deps);
+      return compiled.apply(null, args);
     } catch (err) {
-      console.error("Transform execution error:", err);
-      return { error: String(err) };
+      console.warn("Transform execution error:", err);
+      return null;
     }
   }
 
-  async evaluate(fn: string, deps: Record<string, unknown>): Promise<unknown> {
-    return this.evaluateSync(fn, deps);
+  async evaluate(fn: string, args: unknown[]): Promise<unknown> {
+    return this.evaluateSync(fn, args);
   }
 
   dispose(): void {
